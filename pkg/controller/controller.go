@@ -63,6 +63,7 @@ type secretConf struct {
 	certSectretKey  string
 	certSecretPKKey string
 	certSecretCAKey string
+	configMapName   string
 }
 
 // Reconcile will ensure that the dapr trust-bundle Secret is updated with the
@@ -169,9 +170,24 @@ func (s *secretCtrl) reconcileBundle(ctx context.Context, log logr.Logger, conf 
 		}
 	}
 
+	var daprConfigMap corev1.ConfigMap
+	if len(conf.configMapName) > 0 {
+		err = s.lister.Get(ctx, types.NamespacedName{
+			Namespace: s.daprNamespace,
+			Name:      conf.configMapName,
+		}, &daprConfigMap)
+		if apierrors.IsNotFound(err) {
+			log.Error(err, "dapr trust-bundle ConfigMap does not exist")
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+
 	dbg.Info("found dapr certificate Secret")
 
-	ta, shouldReconcile, err := s.shouldReconcileSecret(log, dbg, conf, daprCertSecret, daprCASecret, cmSecret)
+	ta, shouldReconcile, err := s.shouldReconcileSecret(log, dbg, conf, daprCertSecret, daprCASecret, cmSecret, daprConfigMap)
 	if err != nil {
 		return err
 	}
@@ -218,7 +234,22 @@ func (s *secretCtrl) reconcileBundle(ctx context.Context, log logr.Logger, conf 
 	}
 	daprCASecret.Data[conf.certSecretCAKey] = taPEM
 
-	return s.client.Update(ctx, &daprCASecret)
+	if err := s.client.Update(ctx, &daprCASecret); err != nil {
+		return err
+	}
+
+	if len(conf.configMapName) == 0 {
+		return nil
+	}
+
+	log.Info("updating dapr trust-bundle ConfigMap")
+
+	if daprConfigMap.Data == nil {
+		daprConfigMap.Data = make(map[string]string)
+	}
+	daprConfigMap.Data[conf.certSecretCAKey] = string(taPEM)
+
+	return s.client.Update(ctx, &daprConfigMap)
 }
 
 // shouldReconcileSecret returns true if the Secret should be reconciled.
@@ -227,6 +258,7 @@ func (s *secretCtrl) reconcileBundle(ctx context.Context, log logr.Logger, conf 
 func (s *secretCtrl) shouldReconcileSecret(log, dbg logr.Logger,
 	conf secretConf,
 	daprCertSecret, daprCASecret, cmSecret corev1.Secret,
+	daprConfigMap corev1.ConfigMap,
 ) (*x509bundle.Bundle, bool, error) {
 	var shouldReconcile bool
 
@@ -287,6 +319,24 @@ func (s *secretCtrl) shouldReconcileSecret(log, dbg logr.Logger,
 				dbg.Info("dapr trust-bundle Secret is missing trust anchor")
 			}
 		}
+
+		if len(conf.configMapName) > 0 {
+			if len(daprConfigMap.Data[conf.certSecretCAKey]) == 0 {
+				shouldReconcile = true
+				dbg.Info("dapr trust-bundle ConfigMap ca.crt is empty")
+			} else {
+				configMapTA, err := x509bundle.Parse(spiffeid.TrustDomain{}, []byte(daprConfigMap.Data[conf.certSecretCAKey]))
+				if err != nil {
+					return nil, false, fmt.Errorf("failed to parse trust anchor from dapr ConfigMap: %w", err)
+				}
+				for _, cert := range daprTA.X509Authorities() {
+					if !configMapTA.HasX509Authority(cert) {
+						shouldReconcile = true
+						dbg.Info("dapr trust-bundle ConfigMap is missing trust anchor")
+					}
+				}
+			}
+		}
 	}
 
 	if shouldReconcile {
@@ -326,6 +376,7 @@ func AddTrustBundle(mgr ctrl.Manager, opts Options) error {
 			certSectretKey:  "issuer.crt",
 			certSecretPKKey: "issuer.key",
 			certSecretCAKey: "ca.crt",
+			configMapName:   "dapr-trust-bundle",
 		})
 	}
 
@@ -376,6 +427,15 @@ func AddTrustBundle(mgr ctrl.Manager, opts Options) error {
 		), builder.OnlyMetadata, builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 			// Only reconcile the cert-manager Certificates we are watching.
 			return obj.GetNamespace() == opts.DaprNamespace && obj.GetName() == opts.TrustBundleCertificateName
+		}))).
+
+		// Watch the target trust-bundle ConfigMap so that drift triggers reconciliation.
+		Watches(new(corev1.ConfigMap), handler.EnqueueRequestsFromMapFunc(
+			func(_ context.Context, obj client.Object) []ctrl.Request {
+				return []ctrl.Request{{NamespacedName: types.NamespacedName{Namespace: opts.DaprNamespace, Name: "dapr-trust-bundle"}}}
+			},
+		), builder.OnlyMetadata, builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetNamespace() == opts.DaprNamespace && obj.GetName() == "dapr-trust-bundle"
 		})))
 
 	if opts.TrustAnchor != nil {

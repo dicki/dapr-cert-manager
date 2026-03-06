@@ -24,6 +24,23 @@ rules:
   resourceNames:
   - dapr-trust-bundle
 - apiGroups:
+  - ""
+  resources:
+  - "configmaps"
+  verbs:
+  - "get"
+  - "list"
+  - "watch"
+# Only allow update to the dapr ConfigMaps.
+- apiGroups:
+  - ""
+  resources:
+  - "configmaps"
+  verbs:
+  - "update"
+  resourceNames:
+  - dapr-trust-bundle
+- apiGroups:
   - "cert-manager.io"
   resources:
   - "certificates"
