@@ -58,4 +58,44 @@ var _ = Describe("Smoke", func() {
 		Expect(daprCA.X509Authorities()).To(HaveLen(2))
 		Expect(daprCA.HasX509Authority(cmCA.X509Authorities()[0])).To(BeTrue(), "the trust-bundle secret should have the same root CA as the cert-manager issuer")
 	})
+
+	It("the helper should update the trust-bundle ConfigMap with the same ca.crt as the trust-bundle Secret", func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		scheme := runtime.NewScheme()
+		Expect(corev1.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(cmapi.AddToScheme(scheme)).NotTo(HaveOccurred())
+
+		cl, err := client.New(cnf.RestConfig, client.Options{
+			Scheme: scheme,
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		var (
+			daprSecret    corev1.Secret
+			daprConfigMap corev1.ConfigMap
+		)
+
+		Eventually(func() bool {
+			Expect(cl.Get(ctx, client.ObjectKey{Namespace: cnf.DaprNamespace, Name: "dapr-trust-bundle"}, &daprSecret)).NotTo(HaveOccurred())
+			Expect(cl.Get(ctx, client.ObjectKey{Namespace: cnf.DaprNamespace, Name: "dapr-trust-bundle"}, &daprConfigMap)).NotTo(HaveOccurred())
+
+			return len(daprSecret.Data["ca.crt"]) > 0 &&
+				bytes.Equal(daprSecret.Data["ca.crt"], []byte(daprConfigMap.Data["ca.crt"]))
+		}, "20s", "100ms").Should(BeTrue(), "the trust-bundle ConfigMap should have the same ca.crt as the trust-bundle Secret")
+
+		daprSecretCA, err := x509bundle.Parse(spiffeid.TrustDomain{}, daprSecret.Data["ca.crt"])
+		Expect(err).NotTo(HaveOccurred())
+
+		daprConfigMapCA, err := x509bundle.Parse(spiffeid.TrustDomain{}, []byte(daprConfigMap.Data["ca.crt"]))
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(daprConfigMapCA.X509Authorities()).To(HaveLen(len(daprSecretCA.X509Authorities())),
+			"the trust-bundle ConfigMap should have the same number of CA authorities as the trust-bundle Secret")
+		for _, authority := range daprSecretCA.X509Authorities() {
+			Expect(daprConfigMapCA.HasX509Authority(authority)).To(BeTrue(),
+				"the trust-bundle ConfigMap should contain all CA authorities from the trust-bundle Secret")
+		}
+	})
 })
