@@ -1,5 +1,9 @@
 # dapr-cert-manager
 
+> [!IMPORTANT]
+> This fork has been revised to update the configmap dapr-trust-bundle as well as the secrets.
+> This is an attempt to get the Sentry service to accept the newly generated certs.
+
 dapr-cert-manager is a simple controller to allow [dapr](https://dapr.io)
 installations to use Certificates originating from
 [cert-manager](https://cert-manager.io). This controller watches a
