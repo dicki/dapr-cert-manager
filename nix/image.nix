@@ -12,7 +12,7 @@ let
     modules = ../gomod2nix.toml;
     inherit src;
     subPackages = [ "cmd" ];
-  }).overrideAttrs(old: old // {
+  }).overrideAttrs(old: {
     GOOS = os;
     GOARCH = sys;
     CGO_ENABLED = "0";

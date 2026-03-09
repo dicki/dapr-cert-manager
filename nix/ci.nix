@@ -29,11 +29,13 @@ let
     name = "dapr-cert-manager-smoke";
     src = "${src-test}/smoke";
     modules = "${src-test}/smoke/gomod2nix.toml";
-  }).overrideAttrs(old: old // {
-    # We need to use a custom `buildPhase` so that we can build the smoke
-    # binary using `go test` instead of `go build`.
+  }).overrideAttrs(old: {
+    # We use a custom `buildPhase` to build the smoke binary using `go test`.
+    # Important: Always include runHook preBuild and postBuild when overriding phases!
     buildPhase = ''
+      runHook preBuild
       go test -v --race -o $GOPATH/bin/dapr-cert-manager-smoke -c ./.
+      runHook postBuild
     '';
   });
 
