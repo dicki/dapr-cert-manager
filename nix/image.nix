@@ -5,7 +5,7 @@ version,
 }:
 
 let
-  name = "ghcr.io/diagridio/dapr-cert-manager";
+  name = "ghcr.io/dicki/dapr-cert-manager";
 
   binary = sys: os: (pkgs.buildGoApplication {
     name = "dapr-cert-manager";
