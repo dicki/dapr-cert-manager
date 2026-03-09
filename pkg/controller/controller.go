@@ -76,7 +76,9 @@ func (s *secretCtrl) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// source of truth, and will update the dapr trust-bundle Secret with the
 	// latest data.
 
-	log := s.log.WithValues("reconciled_secret", req.NamespacedName)
+	log := s.log.WithValues("reconciled_object", req.NamespacedName)
+
+	log.V(3).Info("starting reconciliation", "num_confs", len(s.confs))
 
 	var (
 		wg   sync.WaitGroup
@@ -98,8 +100,12 @@ func (s *secretCtrl) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	wg.Wait()
 	if len(errs) > 0 {
-		return ctrl.Result{}, fmt.Errorf("failed to reconcile: %v", errors.Join(errs...))
+		err := fmt.Errorf("failed to reconcile: %v", errors.Join(errs...))
+		log.Error(err, "reconciliation failed")
+		return ctrl.Result{}, err
 	}
+
+	log.V(3).Info("reconciliation complete")
 	return ctrl.Result{}, nil
 }
 
@@ -107,21 +113,22 @@ func (s *secretCtrl) reconcileBundle(ctx context.Context, log logr.Logger, conf 
 	log = log.WithValues("cert_name", conf.certName)
 	dbg := log.V(3)
 
-	dbg.Info("reconciling")
+	dbg.Info("reconciling trust bundle")
 
 	var cert cmapi.Certificate
 	err := s.lister.Get(ctx, types.NamespacedName{Namespace: s.daprNamespace, Name: conf.certName}, &cert)
 	if apierrors.IsNotFound(err) {
 		// The cert-manager Certificate resource does not exist, so we can't
 		// do anything.
-		dbg.Info("cert-manager Certificate resource does not exist")
+		dbg.Info("cert-manager Certificate resource does not exist, skipping reconciliation")
 		return nil
 	}
 	if err != nil {
+		log.Error(err, "failed to get cert-manager Certificate resource", "name", conf.certName, "namespace", s.daprNamespace)
 		return err
 	}
 
-	dbg.Info("found cert-manager Certificate resource")
+	dbg.Info("found cert-manager Certificate resource", "secret_name", cert.Spec.SecretName)
 
 	var cmSecret corev1.Secret
 	err = s.lister.Get(ctx, types.NamespacedName{
@@ -129,10 +136,11 @@ func (s *secretCtrl) reconcileBundle(ctx context.Context, log logr.Logger, conf 
 		Name:      cert.Spec.SecretName,
 	}, &cmSecret)
 	if apierrors.IsNotFound(err) {
-		dbg.Info("cert-manager Secret does not exist", "secret", cert.Spec.SecretName)
+		dbg.Info("cert-manager Secret does not exist, skipping reconciliation", "secret", cert.Spec.SecretName)
 		return nil
 	}
 	if err != nil {
+		log.Error(err, "failed to get cert-manager Secret", "secret", cert.Spec.SecretName, "namespace", cert.Namespace)
 		return err
 	}
 
@@ -144,12 +152,15 @@ func (s *secretCtrl) reconcileBundle(ctx context.Context, log logr.Logger, conf 
 		Name:      conf.certSecretName,
 	}, &daprCertSecret)
 	if apierrors.IsNotFound(err) {
-		log.Error(err, "dapr certificate Secret does not exist")
+		log.Error(err, "dapr certificate Secret does not exist", "name", conf.certSecretName, "namespace", s.daprNamespace)
 		return nil
 	}
 	if err != nil {
+		log.Error(err, "failed to get dapr certificate Secret", "name", conf.certSecretName, "namespace", s.daprNamespace)
 		return err
 	}
+
+	dbg.Info("found dapr certificate Secret", "name", conf.certSecretName)
 
 	var daprCASecret corev1.Secret
 	if len(conf.caSecretName) > 0 {
@@ -161,12 +172,14 @@ func (s *secretCtrl) reconcileBundle(ctx context.Context, log logr.Logger, conf 
 				Name:      conf.caSecretName,
 			}, &daprCASecret)
 			if apierrors.IsNotFound(err) {
-				log.Error(err, "dapr CA certificate Secret does not exist")
+				log.Error(err, "dapr CA certificate Secret does not exist", "name", conf.caSecretName, "namespace", s.daprNamespace)
 				return nil
 			}
 			if err != nil {
+				log.Error(err, "failed to get dapr CA certificate Secret", "name", conf.caSecretName, "namespace", s.daprNamespace)
 				return err
 			}
+			dbg.Info("found dapr CA certificate Secret", "name", conf.caSecretName)
 		}
 	}
 
@@ -177,27 +190,28 @@ func (s *secretCtrl) reconcileBundle(ctx context.Context, log logr.Logger, conf 
 			Name:      conf.configMapName,
 		}, &daprConfigMap)
 		if apierrors.IsNotFound(err) {
-			log.Error(err, "dapr trust-bundle ConfigMap does not exist")
+			log.Error(err, "dapr trust-bundle ConfigMap does not exist", "name", conf.configMapName, "namespace", s.daprNamespace)
 			return nil
 		}
 		if err != nil {
+			log.Error(err, "failed to get dapr trust-bundle ConfigMap", "name", conf.configMapName, "namespace", s.daprNamespace)
 			return err
 		}
+		dbg.Info("found dapr trust-bundle ConfigMap", "name", conf.configMapName)
 	}
-
-	dbg.Info("found dapr certificate Secret")
 
 	ta, shouldReconcile, err := s.shouldReconcileSecret(log, dbg, conf, daprCertSecret, daprCASecret, cmSecret, daprConfigMap)
 	if err != nil {
+		log.Error(err, "failed to determine if trust-bundle needs reconciliation")
 		return err
 	}
 
 	if !shouldReconcile {
-		log.Info("dapr trust-bundle Secret is up to date")
+		log.V(3).Info("dapr trust-bundle is up to date, no reconciliation needed")
 		return nil
 	}
 
-	log.Info("updating dapr certificate Secret")
+	log.Info("updating dapr certificate Secret", "name", conf.certSecretName, "namespace", s.daprNamespace)
 
 	// Preserve existing keys in the dapr certificate Secret since it might be
 	// the case that the same Secret is used for the cert-manager Certificate for
@@ -209,8 +223,11 @@ func (s *secretCtrl) reconcileBundle(ctx context.Context, log logr.Logger, conf 
 	daprCertSecret.Data[conf.certSecretPKKey] = cmSecret.Data[corev1.TLSPrivateKeyKey]
 
 	if err := s.client.Update(ctx, &daprCertSecret); err != nil {
+		log.Error(err, "failed to update dapr certificate Secret", "name", conf.certSecretName, "namespace", s.daprNamespace)
 		return err
 	}
+
+	log.V(3).Info("successfully updated dapr certificate Secret", "name", conf.certSecretName)
 
 	if len(conf.caSecretName) == 0 {
 		return nil
@@ -229,27 +246,38 @@ func (s *secretCtrl) reconcileBundle(ctx context.Context, log logr.Logger, conf 
 		daprCASecret = daprCertSecret
 	}
 
+	log.Info("updating dapr CA Secret with trust anchors", "name", conf.caSecretName, "namespace", s.daprNamespace)
+
 	if daprCASecret.Data == nil {
 		daprCASecret.Data = make(map[string][]byte)
 	}
 	daprCASecret.Data[conf.certSecretCAKey] = taPEM
 
 	if err := s.client.Update(ctx, &daprCASecret); err != nil {
+		log.Error(err, "failed to update dapr CA Secret", "name", conf.caSecretName, "namespace", s.daprNamespace)
 		return err
 	}
+
+	log.V(3).Info("successfully updated dapr CA Secret", "name", conf.caSecretName)
 
 	if len(conf.configMapName) == 0 {
 		return nil
 	}
 
-	log.Info("updating dapr trust-bundle ConfigMap")
+	log.Info("updating dapr trust-bundle ConfigMap", "name", conf.configMapName, "namespace", s.daprNamespace)
 
 	if daprConfigMap.Data == nil {
 		daprConfigMap.Data = make(map[string]string)
 	}
 	daprConfigMap.Data[conf.certSecretCAKey] = string(taPEM)
 
-	return s.client.Update(ctx, &daprConfigMap)
+	if err := s.client.Update(ctx, &daprConfigMap); err != nil {
+		log.Error(err, "failed to update dapr trust-bundle ConfigMap", "name", conf.configMapName, "namespace", s.daprNamespace)
+		return err
+	}
+
+	log.V(3).Info("successfully updated dapr trust-bundle ConfigMap", "name", conf.configMapName)
+	return nil
 }
 
 // shouldReconcileSecret returns true if the Secret should be reconciled.
@@ -266,14 +294,14 @@ func (s *secretCtrl) shouldReconcileSecret(log, dbg logr.Logger,
 	if len(cmSecret.Data) == 0 ||
 		len(cmSecret.Data[corev1.TLSCertKey]) == 0 ||
 		len(cmSecret.Data[corev1.TLSPrivateKeyKey]) == 0 {
-		dbg.Info("cert-manager Secret has no data")
+		dbg.Info("cert-manager Secret has no data, skipping reconciliation")
 		return nil, false, nil
 	}
 
 	if daprCertSecret.Data == nil ||
 		!bytes.Equal(daprCertSecret.Data[conf.certSectretKey], cmSecret.Data[corev1.TLSCertKey]) ||
 		!bytes.Equal(daprCertSecret.Data[conf.certSecretPKKey], cmSecret.Data[corev1.TLSPrivateKeyKey]) {
-		dbg.Info("data in dapr certificate Secret does not match cert-manager Secret")
+		dbg.Info("data in dapr certificate Secret does not match cert-manager Secret, will reconcile")
 		shouldReconcile = true
 	}
 
@@ -285,6 +313,7 @@ func (s *secretCtrl) shouldReconcileSecret(log, dbg logr.Logger,
 			var err error
 			cmTA, err = s.trustAnchor.GetX509BundleForTrustDomain(spiffeid.TrustDomain{})
 			if err != nil {
+				log.Error(err, "failed to get trust anchor from trust anchor source")
 				return nil, false, err
 			}
 		} else {
@@ -294,8 +323,11 @@ func (s *secretCtrl) shouldReconcileSecret(log, dbg logr.Logger,
 				var err error
 				cmTA, err = x509bundle.Parse(spiffeid.TrustDomain{}, cmSecret.Data[cmmeta.TLSCAKey])
 				if err != nil {
-					return nil, false, fmt.Errorf("failed to parse trust anchor from cert-manager Secret: %w", err)
+					err = fmt.Errorf("failed to parse trust anchor from cert-manager Secret: %w", err)
+					log.Error(err, "failed to parse cert-manager CA trust anchor", "secret", cmSecret.Name)
+					return nil, false, err
 				}
+				dbg.Info("using trust anchor from cert-manager Secret", "secret", cmSecret.Name, "num_authorities", len(cmTA.X509Authorities()))
 			} else {
 				log.Error(errors.New("no trust anchor found in cert-manager Certificate"), "the dapr root trust anchor may be empty!")
 				cmTA = x509bundle.New(spiffeid.TrustDomain{})
@@ -306,9 +338,13 @@ func (s *secretCtrl) shouldReconcileSecret(log, dbg logr.Logger,
 			var err error
 			daprTA, err = x509bundle.Parse(spiffeid.TrustDomain{}, daprCASecret.Data[conf.certSecretCAKey])
 			if err != nil {
-				return nil, false, fmt.Errorf("failed to parse trust anchor from dapr certificate Secret: %w", err)
+				err = fmt.Errorf("failed to parse trust anchor from dapr certificate Secret: %w", err)
+				log.Error(err, "failed to parse dapr CA trust anchor from Secret", "secret", daprCASecret.Name)
+				return nil, false, err
 			}
+			dbg.Info("parsed existing trust anchors from dapr CA Secret", "secret", daprCASecret.Name, "num_authorities", len(daprTA.X509Authorities()))
 		} else {
+			dbg.Info("dapr CA Secret has no existing trust anchors, starting with empty bundle", "secret", daprCASecret.Name)
 			daprTA = x509bundle.New(spiffeid.TrustDomain{})
 		}
 
@@ -316,23 +352,26 @@ func (s *secretCtrl) shouldReconcileSecret(log, dbg logr.Logger,
 			if !daprTA.HasX509Authority(cert) {
 				shouldReconcile = true
 				daprTA.AddX509Authority(cert)
-				dbg.Info("dapr trust-bundle Secret is missing trust anchor")
+				dbg.Info("dapr trust-bundle Secret is missing a trust anchor, will reconcile")
 			}
 		}
 
 		if len(conf.configMapName) > 0 {
 			if len(daprConfigMap.Data[conf.certSecretCAKey]) == 0 {
 				shouldReconcile = true
-				dbg.Info("dapr trust-bundle ConfigMap ca.crt is empty")
+				dbg.Info("dapr trust-bundle ConfigMap ca.crt is empty, will reconcile", "configmap", conf.configMapName)
 			} else {
 				configMapTA, err := x509bundle.Parse(spiffeid.TrustDomain{}, []byte(daprConfigMap.Data[conf.certSecretCAKey]))
 				if err != nil {
-					return nil, false, fmt.Errorf("failed to parse trust anchor from dapr ConfigMap: %w", err)
+					err = fmt.Errorf("failed to parse trust anchor from dapr ConfigMap: %w", err)
+					log.Error(err, "failed to parse dapr CA trust anchor from ConfigMap", "configmap", daprConfigMap.Name)
+					return nil, false, err
 				}
+				dbg.Info("parsed existing trust anchors from dapr trust-bundle ConfigMap", "configmap", daprConfigMap.Name, "num_authorities", len(configMapTA.X509Authorities()))
 				for _, cert := range daprTA.X509Authorities() {
 					if !configMapTA.HasX509Authority(cert) {
 						shouldReconcile = true
-						dbg.Info("dapr trust-bundle ConfigMap is missing trust anchor")
+						dbg.Info("dapr trust-bundle ConfigMap is missing a trust anchor, will reconcile")
 					}
 				}
 			}
@@ -340,10 +379,11 @@ func (s *secretCtrl) shouldReconcileSecret(log, dbg logr.Logger,
 	}
 
 	if shouldReconcile {
+		log.V(3).Info("trust-bundle requires reconciliation")
 		return daprTA, true, nil
 	}
 
-	dbg.Info("dapr trust-bundle Secret has correct issuer and all required trust anchor")
+	dbg.Info("dapr trust-bundle Secret and ConfigMap have correct issuer and all required trust anchors, no update needed")
 
 	// TODO: @joshvanl do validation to ensure that the certificates are
 	// appropriate.
